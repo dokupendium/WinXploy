@@ -6,7 +6,7 @@ This words wrote the German author Hermann Hesse — no doubt on a typewriter. H
 I am sure that he might have lost that magic before writing *Steps*.
 
 WinXploy aims to automate the process of (re-)building a productive Windows OS from scratch to make it less time consuming.
-Basically it is just a simple PowerShell-Script (WinXploy.ps1) which makes use of and orchestrates other tools or their functions.
+Basically it is just a simple PowerShell-Script (`WinXploy.ps1`) which makes use of and orchestrates other tools or their functions.
 The real hard work is done by all the great open source projects it makes use of, big thanks for sharing!
 
 ## How it works?
