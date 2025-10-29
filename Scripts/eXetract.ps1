@@ -1,90 +1,203 @@
 <#
-  .SYNOPSIS
-  Extracts `.exe` files using 7-Zip.
-    
-  .DESCRIPTION
-  This script searches a source folder for `.exe` files,
-  treats each `.exe` as an archive and extracts its contents
-  into a separate subfolder with the same name in the target directory.
-    
-  .REQUIRES
-  `7z.exe`, the ommand line version of 7-Zip (https://www.7-zip.org/).
-    
-  .NOTES
-  Version:          1.0
-  Author:           ~ mimic ~
-  Creation Date:    26 okt 2025
+.SYNOPSIS
+    Extracts Windows driver installation executables by leveraging 7-Zip.
+
+.DESCRIPTION
+    eXetract.ps1 scans the provided source directory for executable files (*.exe).
+    Every discovered file is treated as an archive and unpacked into a dedicated
+    subfolder beneath the chosen target directory. The script uses the console
+    variant of 7-Zip (7z/7zz) to avoid triggering installer GUIs and to ensure a
+    fully unattended workflow for reverse-engineering or repackaging driver
+    payloads. The script auto-detects 7-Zip in common installation locations, can
+    respect the SEVEN_ZIP_PATH environment variable, and falls back to executables
+    that are available via the PATH environment variable. Cross-platform usage on
+    Windows, Linux, and macOS is supported as long as a compatible 7-Zip binary is
+    installed.
+
+.PARAMETER SourceFolder
+    Path to the directory containing the driver installation executables that
+    should be extracted. The folder must exist.
+
+.PARAMETER TargetFolder
+    Path to the directory that will receive the extracted content. The folder is
+    created automatically when it does not already exist.
+
+.EXAMPLE
+    PS> .\eXetract.ps1 -SourceFolder "C:\\Temp\\Drivers" -TargetFolder "C:\\Temp\\Extracted"
+    Extracts every .exe file inside the Drivers directory into a dedicated folder
+    inside C:\\Temp\\Extracted by using 7-Zip.
+
+.EXAMPLE
+    PS> .\eXetract.ps1 -SourceFolder ./Installers -TargetFolder ./Packages -Verbose
+    Executes the extraction in verbose mode while honoring -WhatIf/-Confirm switches.
+
+.NOTES
+    Author : ~ mimic ~ (release build prepared by OpenAI Assistant)
+    Requires: 7-Zip (https://www.7-zip.org/)
+    Hint   : Use the environment variable SEVEN_ZIP_PATH to override autodetection.
+    Version: 1.0
 #>
 
-# --- 1. KONFIGURATION (Bitte anpassen) ---
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [ValidateScript({
+            if (-not (Test-Path -LiteralPath $_ -PathType Container)) {
+                throw "The source folder '$_' was not found."
+            }
 
-# Pfad zur 7-Zip Kommandozeile (7z.exe)
-# Standardpfade sind hier einkommentiert.
-$PathTo7zip = "C:\Program Files\7-Zip\7z.exe"
-# $PathTo7zip = "C:\Program Files (x86)\7-Zip\7z.exe"
+            return $true
+        })]
+    [string]$SourceFolder,
 
-# Quellordner (wo die .exe-Dateien von Lenovo liegen)
-$SourceFolder = "C:\temp\Lenovo-Treiber" # <--- ANPASSEN
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$TargetFolder
+)
 
-# Zielordner (wo die entpackten Treiber-Ordner erstellt werden sollen)
-$OutputBase = "C:\temp\Extracted-Drivers" # <--- ANPASSEN
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
+function Resolve-SevenZipPath {
+    <#
+        .SYNOPSIS
+            Determines the absolute path to a usable 7-Zip console executable.
 
-# --- 2. SKRIPT-LOGIK (Keine Änderungen nötig) ---
+        .OUTPUTS
+            System.String. The fully qualified path to the executable.
 
-# Prüfen, ob 7z.exe existiert
-if (-not (Test-Path $PathTo7zip)) {
-    Write-Warning "7-Zip (7z.exe) wurde nicht unter '$PathTo7zip' gefunden."
-    Write-Warning "Bitte 7-Zip installieren (https://www.7-zip.org/) und den Pfad im Skript anpassen."
-    # Das Skript wird hier absichtlich nicht gestoppt, falls 7z im PATH liegt.
+        .NOTES
+            Preference order:
+              1. Explicit SEVEN_ZIP_PATH environment variable
+              2. Well known installation paths (Program Files variations)
+              3. 7z/7zz executables found through Get-Command (PATH environment variable)
+    #>
+    [CmdletBinding()]
+    param()
+
+    $candidatePaths = @()
+
+    if ($env:SEVEN_ZIP_PATH) {
+        $candidatePaths += $env:SEVEN_ZIP_PATH
+    }
+
+    $programFilesW6432 = [Environment]::GetEnvironmentVariable('ProgramW6432')
+    if ($programFilesW6432) {
+        $candidatePaths += Join-Path -Path $programFilesW6432 -ChildPath '7-Zip\\7z.exe'
+    }
+
+    $programFiles = [Environment]::GetEnvironmentVariable('ProgramFiles')
+    if ($programFiles) {
+        $candidatePaths += Join-Path -Path $programFiles -ChildPath '7-Zip\\7z.exe'
+    }
+
+    $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    if ($programFilesX86) {
+        $candidatePaths += Join-Path -Path $programFilesX86 -ChildPath '7-Zip\\7z.exe'
+    }
+
+    $candidatePaths += @(
+        Join-Path -Path $PSScriptRoot -ChildPath '7z.exe'
+        Join-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath 'Bin') -ChildPath '7z.exe'
+        Join-Path -Path $PSScriptRoot -ChildPath '7zz'
+        Join-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath 'Bin') -ChildPath '7zz'
+        Join-Path -Path $PSScriptRoot -ChildPath '7zz.exe'
+        Join-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath 'Bin') -ChildPath '7zz.exe'
+    )
+
+    foreach ($path in $candidatePaths | Where-Object { $_ }) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $path).ProviderPath
+        }
+    }
+
+    $command = Get-Command -Name @('7z.exe', '7z', '7zz', '7za') -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) {
+        return $command.Source
+    }
+
+    throw "Unable to locate a 7-Zip console executable. Install 7-Zip or point SEVEN_ZIP_PATH to the binary."
 }
 
-# Sicherstellen, dass der Basis-Zielordner existiert
-if (-not (Test-Path $OutputBase)) {
-    Write-Host "Erstelle Zielordner: $OutputBase" -ForegroundColor Yellow
-    New-Item -ItemType Directory -Path $OutputBase | Out-Null
+function Ensure-Directory {
+    <#
+        .SYNOPSIS
+            Creates a directory when it does not exist yet.
+
+        .PARAMETER Path
+            The directory path that should exist after the function returns.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -Path $Path -PathType Container)) {
+        Write-Verbose "Creating directory '$Path'."
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
 }
 
-# Alle .exe-Dateien im Quellordner holen
-$driverFiles = Get-ChildItem -Path $SourceFolder -Filter "*.exe"
+Ensure-Directory -Path $TargetFolder
 
-if ($driverFiles.Count -eq 0) {
-    Write-Warning "Keine .exe-Dateien im Quellordner '$SourceFolder' gefunden."
+$SourceFolder = (Resolve-Path -LiteralPath $SourceFolder).ProviderPath
+$TargetFolder = (Resolve-Path -LiteralPath $TargetFolder).ProviderPath
+
+try {
+    $sevenZipPath = Resolve-SevenZipPath
+}
+catch {
+    throw $_
+}
+
+Write-Verbose "Using 7-Zip located at '$sevenZipPath'."
+
+$driverFiles = @(Get-ChildItem -Path $SourceFolder -Filter '*.exe' -File -ErrorAction Stop | Sort-Object -Property Name)
+if (-not $driverFiles) {
+    Write-Warning "No .exe files found in source folder '$SourceFolder'."
     return
 }
 
-Write-Host "Starte Batch-Extraktion für $($driverFiles.Count) Treiber..." -ForegroundColor Green
+Write-Host "Starting batch extraction for $($driverFiles.Count) file(s)." -ForegroundColor Green
 
 foreach ($file in $driverFiles) {
     Write-Host "---"
-    Write-Host "Verarbeite: $($file.Name)"
-    
-    # Der Zielordner wird nach der .exe-Datei benannt (ohne .exe)
-    $destFolder = Join-Path $OutputBase -ChildPath $file.BaseName
-    
-    # Erstelle den Ordner (ignoriert Fehler, falls er schon existiert)
-    New-Item -ItemType Directory -Path $destFolder -ErrorAction SilentlyContinue | Out-Null
-    
-    # 7-Zip Argumente:
-    # 'x' = Extrahiere mit vollen Pfaden (erhält die Ordnerstruktur im Archiv)
-    # '-y' = Ja zu allen Abfragen (z.B. Überschreiben)
-    # '-o' = Output-Ordner (Syntax: -o"Pfad" OHNE Leerzeichen dazwischen)
+    Write-Host "Processing: $($file.Name)"
+
+    $destination = Join-Path -Path $TargetFolder -ChildPath $file.BaseName
+    Ensure-Directory -Path $destination
+
+    if (-not $PSCmdlet.ShouldProcess($file.FullName, "Extract to '$destination'")) {
+        continue
+    }
+
     $arguments = @(
-        "x",                 # Extrahiere mit vollen Pfaden
-        $file.FullName,      # Quelldatei
-        "-o$destFolder",     # Zielordner (Syntax: -oKEINLEERZEICHENpfad)
-        "-y"                 # Ja zu allen Abfragen
+        'x'
+        $file.FullName
+        "-o$destination"
+        '-y'
     )
-    
-    # Führe 7-Zip aus und warte, bis es fertig ist (kein neues Fenster, keine Shell-Ausgabe)
+
+    Write-Verbose "Launching 7-Zip for '$($file.FullName)' -> '$destination'."
+
     try {
-        Start-Process -FilePath $PathTo7zip -ArgumentList $arguments -Wait -NoNewWindow -WindowStyle Hidden
-        Write-Host "Erfolgreich extrahiert -> $destFolder" -ForegroundColor Cyan
+        $process = Start-Process -FilePath $sevenZipPath -ArgumentList $arguments -Wait -NoNewWindow -PassThru -ErrorAction Stop
     }
     catch {
-        Write-Error "Fehler beim Extrahieren von $($file.Name): $_"
+        Write-Error "Failed to launch 7-Zip: $_"
+        continue
+    }
+
+    if ($process.ExitCode -eq 0) {
+        Write-Host "Successfully extracted -> $destination" -ForegroundColor Cyan
+    }
+    else {
+        Write-Error "Extraction failed for $($file.Name) (exit code: $($process.ExitCode))."
     }
 }
 
 Write-Host "---"
-Write-Host "Batch-Extraktion abgeschlossen." -ForegroundColor Green
+Write-Host "Batch extraction completed." -ForegroundColor Green
